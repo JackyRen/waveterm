@@ -6,22 +6,27 @@ package suggestion
 import (
 	"container/heap"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/junegunn/fzf/src/algo"
 	"github.com/junegunn/fzf/src/util"
 	"github.com/wavetermdev/waveterm/pkg/faviconcache"
+	"github.com/wavetermdev/waveterm/pkg/filestore"
 	"github.com/wavetermdev/waveterm/pkg/util/fileutil"
 	"github.com/wavetermdev/waveterm/pkg/util/utilfn"
 	"github.com/wavetermdev/waveterm/pkg/wavebase"
+	"github.com/wavetermdev/waveterm/pkg/waveobj"
 	"github.com/wavetermdev/waveterm/pkg/wconfig"
 	"github.com/wavetermdev/waveterm/pkg/wshrpc"
+	"github.com/wavetermdev/waveterm/pkg/wstore"
 )
 
 const MaxSuggestions = 50
@@ -143,7 +148,165 @@ func FetchSuggestions(ctx context.Context, data wshrpc.FetchSuggestionsData) (*w
 	if data.SuggestionType == "bookmark" {
 		return fetchBookmarkSuggestions(ctx, data)
 	}
+	if data.SuggestionType == "command" {
+		return fetchCommandSuggestions(ctx, data)
+	}
 	return nil, fmt.Errorf("unsupported suggestion type: %q", data.SuggestionType)
+}
+
+var shellCodeBlockRegex = regexp.MustCompile("(?s)```(?:bash|sh|zsh|shell)?\\s*(.*?)```")
+
+func extractEnvVarName(query string) string {
+	if strings.HasPrefix(query, "${") {
+		return strings.TrimPrefix(query, "${")
+	}
+	if strings.HasPrefix(query, "$") {
+		return strings.TrimPrefix(query, "$")
+	}
+	return ""
+}
+
+func commandSuggestionScore(query string, candidate string) int {
+	if query == "" || candidate == "" {
+		return 0
+	}
+	q := strings.ToLower(query)
+	c := strings.ToLower(candidate)
+	if strings.HasPrefix(c, q) {
+		return 120 - len(candidate)/8
+	}
+	if strings.Contains(c, q) {
+		return 60 - len(candidate)/12
+	}
+	return 0
+}
+
+func collectEnvVarSuggestions(query string, seen map[string]bool, suggestions *[]wshrpc.SuggestionType) {
+	envNameQuery := extractEnvVarName(query)
+	if envNameQuery == "" {
+		return
+	}
+	for _, env := range os.Environ() {
+		eqIdx := strings.Index(env, "=")
+		if eqIdx <= 0 {
+			continue
+		}
+		name := env[:eqIdx]
+		score := commandSuggestionScore(envNameQuery, name)
+		if score <= 0 {
+			continue
+		}
+		display := "$" + name
+		if seen[display] {
+			continue
+		}
+		seen[display] = true
+		*suggestions = append(*suggestions, wshrpc.SuggestionType{
+			Type:         "command",
+			SuggestionId: "env:" + name,
+			Display:      display,
+			SubText:      "Environment variable",
+			Icon:         "dollar-sign",
+			Score:        score + 20,
+		})
+	}
+}
+
+func extractCommandsFromAIContent(content string) []string {
+	var commands []string
+	matches := shellCodeBlockRegex.FindAllStringSubmatch(content, -1)
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		for _, line := range strings.Split(m[1], "\n") {
+			line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "$ "))
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			commands = append(commands, line)
+		}
+	}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "$ ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "$ "))
+			if line != "" {
+				commands = append(commands, line)
+			}
+		}
+	}
+	return commands
+}
+
+func collectAICommandSuggestions(ctx context.Context, query string, seen map[string]bool, suggestions *[]wshrpc.SuggestionType) {
+	if strings.TrimSpace(query) == "" {
+		return
+	}
+	blocks, err := wstore.DBGetAllObjsByType[*waveobj.Block](ctx, waveobj.OType_Block)
+	if err != nil {
+		return
+	}
+	for _, block := range blocks {
+		if block.Meta.GetString(waveobj.MetaKey_View, "") != "waveai" {
+			continue
+		}
+		_, data, err := filestore.WFS.ReadFile(ctx, block.OID, "aidata")
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		var history []wshrpc.WaveAIPromptMessageType
+		if err := json.Unmarshal(data, &history); err != nil {
+			continue
+		}
+		for _, msg := range history {
+			if msg.Role != "assistant" {
+				continue
+			}
+			for _, cmd := range extractCommandsFromAIContent(msg.Content) {
+				score := commandSuggestionScore(query, cmd)
+				if score <= 0 {
+					continue
+				}
+				if seen[cmd] {
+					continue
+				}
+				seen[cmd] = true
+				*suggestions = append(*suggestions, wshrpc.SuggestionType{
+					Type:         "command",
+					SuggestionId: "ai:" + cmd,
+					Display:      cmd,
+					SubText:      "From Wave AI reply",
+					Icon:         "sparkles",
+					Score:        score,
+				})
+			}
+		}
+	}
+}
+
+func fetchCommandSuggestions(ctx context.Context, data wshrpc.FetchSuggestionsData) (*wshrpc.FetchSuggestionsResponse, error) {
+	if data.SuggestionType != "command" {
+		return nil, fmt.Errorf("unsupported suggestion type: %q", data.SuggestionType)
+	}
+	query := strings.TrimSpace(data.Query)
+	seen := make(map[string]bool)
+	var suggestions []wshrpc.SuggestionType
+
+	collectEnvVarSuggestions(query, seen, &suggestions)
+	collectAICommandSuggestions(ctx, query, seen, &suggestions)
+
+	sort.SliceStable(suggestions, func(i, j int) bool {
+		if suggestions[i].Score != suggestions[j].Score {
+			return suggestions[i].Score > suggestions[j].Score
+		}
+		return suggestions[i].Display < suggestions[j].Display
+	})
+	if len(suggestions) > MaxSuggestions {
+		suggestions = suggestions[:MaxSuggestions]
+	}
+
+	return &wshrpc.FetchSuggestionsResponse{ReqNum: data.ReqNum, Suggestions: suggestions}, nil
 }
 
 func filterBookmarksForValid(bookmarks map[string]wconfig.WebBookmark) map[string]wconfig.WebBookmark {

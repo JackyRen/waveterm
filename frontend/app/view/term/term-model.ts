@@ -507,6 +507,52 @@ export class TermViewModel implements ViewModel {
         RpcApi.ControllerInputCommand(TabRpcClient, { blockid: this.blockId, inputdata64: b64data });
     }
 
+    private getCompletionQuery(cursorLinePrefix: string): string {
+        const trimmed = cursorLinePrefix.trimEnd();
+        if (trimmed.length === 0) {
+            return "";
+        }
+        const tokens = trimmed.split(/\s+/);
+        return tokens[tokens.length - 1] ?? "";
+    }
+
+    private getCompletionInsertText(query: string, suggestion: string): string {
+        if (!query || !suggestion) {
+            return "";
+        }
+        const queryLower = query.toLowerCase();
+        const suggestionLower = suggestion.toLowerCase();
+        if (!suggestionLower.startsWith(queryLower)) {
+            return "";
+        }
+        return suggestion.slice(query.length);
+    }
+
+    async triggerKeywordCompletion() {
+        const cursorLinePrefix = this.termRef.current?.getCursorLinePrefix() ?? "";
+        const query = this.getCompletionQuery(cursorLinePrefix);
+        if (!query) {
+            return;
+        }
+        const reqNum = Date.now();
+        const widgetId = `term-completion:${this.blockId}`;
+        const result = await RpcApi.FetchSuggestionsCommand(TabRpcClient, {
+            suggestiontype: "command",
+            query,
+            widgetid: widgetId,
+            reqnum: reqNum,
+        });
+        const firstSuggestion = result?.suggestions?.[0];
+        if (!firstSuggestion?.display) {
+            return;
+        }
+        const insertText = this.getCompletionInsertText(query, firstSuggestion.display);
+        if (!insertText) {
+            return;
+        }
+        this.sendDataToController(insertText);
+    }
+
     setTermMode(mode: "term" | "vdom") {
         if (mode == "term") {
             mode = null;
@@ -742,6 +788,13 @@ export class TermViewModel implements ViewModel {
             event.preventDefault();
             event.stopPropagation();
             getApi().nativePaste();
+            return false;
+        }
+
+        if (keyutil.checkKeyPressed(waveEvent, "Ctrl:Space")) {
+            event.preventDefault();
+            event.stopPropagation();
+            fireAndForget(() => this.triggerKeywordCompletion());
             return false;
         }
 

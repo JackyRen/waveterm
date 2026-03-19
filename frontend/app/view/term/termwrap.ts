@@ -293,6 +293,24 @@ export class TermWrap {
         return this.blockId;
     }
 
+    getCursorLinePrefix(): string {
+        if (!this.terminal) {
+            return "";
+        }
+        const buffer = this.terminal.buffer.active;
+        const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+        if (!line) {
+            return "";
+        }
+        const lineText = line.translateToString(true);
+        const cursorX = Math.max(0, buffer.cursorX);
+        const lineRunes = Array.from(lineText);
+        if (cursorX >= lineRunes.length) {
+            return lineText;
+        }
+        return lineRunes.slice(0, cursorX).join("");
+    }
+
     setCursorStyle(cursorStyle: string) {
         this.terminal.options.cursorStyle = normalizeCursorStyle(cursorStyle);
     }
